@@ -207,21 +207,35 @@ async function refreshFanControl() {
 }
 
 async function toggleFanMode(channel) {
+  const errorBox = document.getElementById('fanControlError');
   const slider = document.getElementById(`slider-${channel}`);
   const manual = !slider.disabled;
   const body = manual
     ? { channel, mode: 'auto' }
     : { channel, mode: 'manual', percent: Number.parseInt(slider.value, 10) };
-  await fetch('/api/fans/control', {
+  const res = await fetch('/api/fans/control', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
   });
+  const payload = await res.json();
+  if (!res.ok) {
+    errorBox.textContent = payload.error || 'Nie udało się zmienić trybu wentylatora';
+    return;
+  }
+  errorBox.textContent = '';
   await refreshFanControl();
 }
 
 async function resetFansAuto() {
-  await fetch('/api/fans/reset', { method: 'POST' });
+  const errorBox = document.getElementById('fanControlError');
+  const res = await fetch('/api/fans/reset', { method: 'POST' });
+  const payload = await res.json();
+  if (!res.ok) {
+    errorBox.textContent = payload.error || 'Nie udało się zresetować trybu wentylatorów';
+    return;
+  }
+  errorBox.textContent = '';
   await refreshFanControl();
 }
 
@@ -279,9 +293,10 @@ async function refresh() {
 
 for (const channel of ['pwm1', 'pwm2', 'pwm3']) {
   document.getElementById(`slider-${channel}`).addEventListener('change', async (event) => {
+    const errorBox = document.getElementById('fanControlError');
     const slider = event.target;
     if (slider.disabled) return;
-    await fetch('/api/fans/control', {
+    const res = await fetch('/api/fans/control', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -290,6 +305,12 @@ for (const channel of ['pwm1', 'pwm2', 'pwm3']) {
         percent: Number.parseInt(slider.value, 10),
       }),
     });
+    const payload = await res.json();
+    if (!res.ok) {
+      errorBox.textContent = payload.error || 'Nie udało się zapisać nowej prędkości';
+      return;
+    }
+    errorBox.textContent = '';
     await refreshFanControl();
   });
 }
@@ -554,7 +575,17 @@ def set_fans_control():
             _write_sysfs_int(_sysfs_file(channel, "_enable"), FAN_AUTO_MODE)
         return jsonify(_read_fan_control_state(channel))
     except PermissionError:
-        return jsonify({"error": "Brak uprawnień do zapisu PWM — sprawdź reguły udev"}), 403
+        return (
+            jsonify(
+                {
+                    "error": (
+                        "Brak uprawnień do zapisu PWM. Uruchom serwis z uprawnieniami roota "
+                        "albo dodaj regułę udev nadającą zapis do plików /sys/class/hwmon/*/pwm*_enable."
+                    )
+                }
+            ),
+            403,
+        )
     except Exception as exc:  # noqa: BLE001
         app.logger.error("Error setting fan control (%s): %s", channel, exc)
         return jsonify({"error": "Błąd zapisu sterowania wentylatorami"}), 500
