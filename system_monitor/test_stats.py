@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from system_monitor import app as monitor_app
 
@@ -105,6 +105,41 @@ class StatsEndpointTest(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         mock_write.assert_any_call('/sys/class/hwmon/hwmon0/pwm1_enable', 1)
         mock_write.assert_any_call('/sys/class/hwmon/hwmon0/pwm1', 64)
+
+    @patch('system_monitor.app._portfolio_repo_available', return_value=True)
+    @patch('system_monitor.app.os.path.exists', return_value=True)
+    def test_portfolio_backend_start_when_already_running_returns_409(self, _mock_exists, _mock_repo):
+        process = MagicMock()
+        process.poll.return_value = None
+        monitor_app._processes['backend'] = process
+        try:
+            response = self.client.post('/api/portfolio/backend/start')
+            self.assertEqual(response.status_code, 409)
+        finally:
+            monitor_app._processes['backend'] = None
+
+    @patch('system_monitor.app._portfolio_repo_available', return_value=True)
+    def test_portfolio_backend_stop_when_not_running_returns_200(self, _mock_repo):
+        monitor_app._processes['backend'] = None
+        response = self.client.post('/api/portfolio/backend/stop')
+        self.assertEqual(response.status_code, 200)
+
+    @patch('system_monitor.app._portfolio_repo_available', return_value=True)
+    @patch('system_monitor.app._get_git_info', return_value={'uncommitted_changes': True})
+    def test_portfolio_git_pull_with_uncommitted_changes_returns_409(self, _mock_git, _mock_repo):
+        response = self.client.post('/api/portfolio/git/pull')
+        self.assertEqual(response.status_code, 409)
+
+    @patch('system_monitor.app._portfolio_repo_available', return_value=True)
+    @patch('system_monitor.app.os.path.exists', return_value=False)
+    def test_portfolio_backend_start_without_venv_returns_503(self, _mock_exists, _mock_repo):
+        response = self.client.post('/api/portfolio/backend/start')
+        self.assertEqual(response.status_code, 503)
+
+    @patch('system_monitor.app._portfolio_repo_available', return_value=False)
+    def test_portfolio_endpoints_without_repo_return_503(self, _mock_repo):
+        response = self.client.get('/api/portfolio/status')
+        self.assertEqual(response.status_code, 503)
 
 
 if __name__ == '__main__':

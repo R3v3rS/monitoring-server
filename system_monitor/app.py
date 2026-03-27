@@ -1,6 +1,9 @@
 import time
 import atexit
 import logging
+import os
+import socket
+import subprocess
 from datetime import datetime
 
 import psutil
@@ -19,6 +22,18 @@ FAN_MIN_PWM = {"pwm1": 64, "pwm2": 0, "pwm3": 0}
 FAN_AUTO_MODE = 5
 FAN_MANUAL_MODE = 1
 _fan_original_modes = {}
+PORTFOLIO_REPO_PATH = "/home/kombat/Portfolio-Manager-PLN"
+PORTFOLIO_VENV_PATH = "/home/kombat/Portfolio-Manager-PLN/venv"
+PORTFOLIO_BACKEND_CMD = [f"{PORTFOLIO_VENV_PATH}/bin/python", "app.py"]
+PORTFOLIO_BACKEND_CWD = "/home/kombat/Portfolio-Manager-PLN/backend"
+PORTFOLIO_FRONTEND_CMD = ["npm", "run", "dev"]
+PORTFOLIO_FRONTEND_CWD = "/home/kombat/Portfolio-Manager-PLN/frontend"
+PORTFOLIO_BACKEND_PORT = 5000
+PORTFOLIO_FRONTEND_PORT = 5173
+LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+BACKEND_LOG_PATH = os.path.join(LOGS_DIR, "backend_portfolio.log")
+FRONTEND_LOG_PATH = os.path.join(LOGS_DIR, "frontend_portfolio.log")
+_processes = {"backend": None, "frontend": None}
 
 
 DASHBOARD_HTML = """
@@ -47,6 +62,15 @@ DASHBOARD_HTML = """
     table { width: 100%; border-collapse: collapse; margin-top: 8px; background: #fff; border-radius: 10px; overflow: hidden; }
     th, td { text-align: left; padding: 8px; border-bottom: 1px solid #eee; font-size: 14px; }
     th { background: #fafafa; }
+    .section-card { background: #fff; border-radius: 10px; padding: 12px; box-shadow: 0 1px 3px rgba(0,0,0,.08); margin-top: 16px; }
+    .status-badge { display: inline-block; padding: 2px 10px; border-radius: 999px; color: #fff; font-weight: bold; font-size: 12px; }
+    .badge-green { background: #188038; }
+    .badge-red { background: #c5221f; }
+    .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 8px 0; }
+    .mono { font-family: monospace; }
+    details { margin-top: 8px; }
+    pre { background: #111; color: #eaeaea; padding: 10px; border-radius: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+    .warning { color: #b26a00; font-weight: bold; }
   </style>
 </head>
 <body>
@@ -141,6 +165,44 @@ DASHBOARD_HTML = """
   </div>
   <p><button onclick="resetFansAuto()">Reset wszystkich do AUTO</button></p>
   <div id="fanControlError" class="red"></div>
+
+  <h2>Zarządzanie portfoliem</h2>
+  <div class="section-card">
+    <div id="portfolioError" class="red"></div>
+    <div class="row">
+      <strong>Backend:</strong>
+      <span id="backendStatusBadge" class="status-badge badge-red">ZATRZYMANY</span>
+      <span id="backendPid" class="mono"></span>
+      <button id="backendToggleBtn" onclick="togglePortfolioProcess('backend')">Start</button>
+    </div>
+    <div class="row">
+      <strong>Frontend:</strong>
+      <span id="frontendStatusBadge" class="status-badge badge-red">ZATRZYMANY</span>
+      <span id="frontendPid" class="mono"></span>
+      <button id="frontendToggleBtn" onclick="togglePortfolioProcess('frontend')">Start</button>
+    </div>
+
+    <div class="row">
+      <strong>Git:</strong>
+      <span>branch: <span id="gitBranch" class="mono">--</span></span>
+      <span>hash: <span id="gitCommit" class="mono">--</span></span>
+      <span>msg: <span id="gitMessage" class="mono">--</span></span>
+      <button id="gitPullBtn" onclick="gitPull()">Git Pull</button>
+    </div>
+    <div id="gitWarning" class="warning"></div>
+    <div class="row">
+      <button onclick="refreshPortfolioLogs()">Odśwież logi</button>
+    </div>
+
+    <details>
+      <summary>Log backend (ostatnie 50 linii)</summary>
+      <pre id="backendLogs">(brak danych)</pre>
+    </details>
+    <details>
+      <summary>Log frontend (ostatnie 50 linii)</summary>
+      <pre id="frontendLogs">(brak danych)</pre>
+    </details>
+  </div>
 
 <script>
 function clsByPercent(value, isTemp=false) {
@@ -239,6 +301,87 @@ async function resetFansAuto() {
   await refreshFanControl();
 }
 
+function updatePortfolioBadge(name, running, pid) {
+  const badge = document.getElementById(`${name}StatusBadge`);
+  const pidBox = document.getElementById(`${name}Pid`);
+  const button = document.getElementById(`${name}ToggleBtn`);
+  badge.textContent = running ? 'DZIAŁA' : 'ZATRZYMANY';
+  badge.className = `status-badge ${running ? 'badge-green' : 'badge-red'}`;
+  pidBox.textContent = running && pid ? `PID: ${pid}` : '';
+  button.textContent = running ? 'Stop' : 'Start';
+}
+
+async function refreshPortfolioStatus() {
+  const errorBox = document.getElementById('portfolioError');
+  try {
+    const res = await fetch('/api/portfolio/status');
+    const payload = await res.json();
+    if (!res.ok) throw new Error(payload.error || 'Nie udało się pobrać statusu portfolio');
+
+    updatePortfolioBadge('backend', payload.backend.running, payload.backend.pid);
+    updatePortfolioBadge('frontend', payload.frontend.running, payload.frontend.pid);
+    document.getElementById('gitBranch').textContent = payload.git.branch || '--';
+    document.getElementById('gitCommit').textContent = payload.git.last_commit || '--';
+    document.getElementById('gitMessage').textContent = payload.git.last_commit_msg || '--';
+
+    const hasChanges = !!payload.git.uncommitted_changes;
+    const gitWarning = document.getElementById('gitWarning');
+    gitWarning.textContent = hasChanges ? 'Uwaga: wykryto niezacommitowane zmiany.' : '';
+    document.getElementById('gitPullBtn').disabled = hasChanges;
+    errorBox.textContent = '';
+  } catch (err) {
+    errorBox.textContent = err.message;
+  }
+}
+
+async function togglePortfolioProcess(name) {
+  const errorBox = document.getElementById('portfolioError');
+  const button = document.getElementById(`${name}ToggleBtn`);
+  const running = button.textContent.trim().toLowerCase() === 'stop';
+  const action = running ? 'stop' : 'start';
+
+  const res = await fetch(`/api/portfolio/${name}/${action}`, { method: 'POST' });
+  const payload = await res.json();
+  if (!res.ok) {
+    errorBox.textContent = payload.error || `Operacja ${action} dla ${name} nieudana`;
+    return;
+  }
+  errorBox.textContent = '';
+  await refreshPortfolioStatus();
+  await refreshPortfolioLogs();
+}
+
+async function gitPull() {
+  const errorBox = document.getElementById('portfolioError');
+  const res = await fetch('/api/portfolio/git/pull', { method: 'POST' });
+  const payload = await res.json();
+  if (!res.ok) {
+    errorBox.textContent = payload.error || 'Git pull nieudany';
+    return;
+  }
+  errorBox.textContent = '';
+  await refreshPortfolioStatus();
+}
+
+async function refreshPortfolioLogs() {
+  const errorBox = document.getElementById('portfolioError');
+  try {
+    const [backendRes, frontendRes] = await Promise.all([
+      fetch('/api/portfolio/logs/backend?lines=50'),
+      fetch('/api/portfolio/logs/frontend?lines=50'),
+    ]);
+    const backendPayload = await backendRes.json();
+    const frontendPayload = await frontendRes.json();
+    if (!backendRes.ok) throw new Error(backendPayload.error || 'Błąd odczytu logów backend');
+    if (!frontendRes.ok) throw new Error(frontendPayload.error || 'Błąd odczytu logów frontend');
+    document.getElementById('backendLogs').textContent = backendPayload.content || '(pusty log)';
+    document.getElementById('frontendLogs').textContent = frontendPayload.content || '(pusty log)';
+    errorBox.textContent = '';
+  } catch (err) {
+    errorBox.textContent = err.message;
+  }
+}
+
 async function refresh() {
   const res = await fetch('/api/stats');
   const s = await res.json();
@@ -317,8 +460,11 @@ for (const channel of ['pwm1', 'pwm2', 'pwm3']) {
 
 refresh();
 refreshFanControl();
+refreshPortfolioStatus();
+refreshPortfolioLogs();
 setInterval(refresh, 2000);
 setInterval(refreshFanControl, 4000);
+setInterval(refreshPortfolioStatus, 5000);
 </script>
 </body>
 </html>
@@ -474,6 +620,121 @@ def _restore_fans_on_exit():
 
 
 _cache_original_fan_modes()
+os.makedirs(LOGS_DIR, exist_ok=True)
+
+
+def _portfolio_repo_available():
+    return os.path.isdir(PORTFOLIO_REPO_PATH)
+
+
+def _portfolio_service_unavailable_response():
+    return jsonify({"error": "Skonfiguruj ścieżki w app.py."}), 503
+
+
+def _is_port_open(port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.2)
+        return sock.connect_ex(("127.0.0.1", port)) == 0
+
+
+def _tail_file(path, lines=50):
+    if not os.path.exists(path):
+        return ""
+    with open(path, "r", encoding="utf-8", errors="replace") as file_handle:
+        content = file_handle.readlines()
+    return "".join(content[-lines:])
+
+
+def _process_is_running(process):
+    return process is not None and process.poll() is None
+
+
+def _get_process_status(name, port):
+    process = _processes[name]
+    running = _process_is_running(process)
+    return {
+        "running": running,
+        "pid": process.pid if running else None,
+        "port_open": _is_port_open(port),
+    }
+
+
+def _get_git_info():
+    branch_proc = subprocess.run(
+        ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        cwd=PORTFOLIO_REPO_PATH,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    log_proc = subprocess.run(
+        ["git", "log", "-1", "--format=%h|%s"],
+        cwd=PORTFOLIO_REPO_PATH,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    status_proc = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=PORTFOLIO_REPO_PATH,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    branch = branch_proc.stdout.strip() if branch_proc.returncode == 0 else "unknown"
+    commit_hash = ""
+    commit_msg = ""
+    if log_proc.returncode == 0 and log_proc.stdout.strip():
+        commit_data = log_proc.stdout.strip().split("|", 1)
+        commit_hash = commit_data[0]
+        commit_msg = commit_data[1] if len(commit_data) > 1 else ""
+
+    return {
+        "branch": branch,
+        "last_commit": commit_hash,
+        "last_commit_msg": commit_msg,
+        "uncommitted_changes": bool(status_proc.stdout.strip()),
+    }
+
+
+def _start_process(name, cmd, cwd, log_path):
+    process = _processes[name]
+    if _process_is_running(process):
+        return jsonify({"error": f"Proces {name} już działa."}), 409
+
+    with open(log_path, "a", encoding="utf-8") as log_file:
+        started = subprocess.Popen(  # noqa: S603
+            cmd,
+            cwd=cwd,
+            stdout=log_file,
+            stderr=log_file,
+        )
+
+    _processes[name] = started
+    return jsonify({"status": "started", "pid": started.pid}), 200
+
+
+def _stop_process(name):
+    process = _processes[name]
+    if not _process_is_running(process):
+        _processes[name] = None
+        return jsonify({"status": "already_stopped"}), 200
+
+    process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    _processes[name] = None
+    return jsonify({"status": "stopped"}), 200
+
+
+@app.before_request
+def _ensure_portfolio_repo_configured():
+    if request.path.startswith("/api/portfolio/") and not _portfolio_repo_available():
+        return _portfolio_service_unavailable_response()
 
 
 @app.route("/")
@@ -596,6 +857,82 @@ def reset_fans():
     errors = _restore_fan_modes(use_original=False)
     status = 500 if errors else 200
     return jsonify({"status": "ok" if not errors else "partial_error", "errors": errors}), status
+
+
+@app.route("/api/portfolio/status", methods=["GET"])
+def portfolio_status():
+    git_info = _get_git_info()
+    return jsonify(
+        {
+            "backend": _get_process_status("backend", PORTFOLIO_BACKEND_PORT),
+            "frontend": _get_process_status("frontend", PORTFOLIO_FRONTEND_PORT),
+            "git": git_info,
+        }
+    )
+
+
+@app.route("/api/portfolio/backend/start", methods=["POST"])
+def portfolio_backend_start():
+    interpreter_path = f"{PORTFOLIO_VENV_PATH}/bin/python"
+    if not os.path.exists(interpreter_path):
+        return jsonify({"error": "Nie znaleziono venv."}), 503
+    app.logger.info("Portfolio action: backend start")
+    return _start_process("backend", PORTFOLIO_BACKEND_CMD, PORTFOLIO_BACKEND_CWD, BACKEND_LOG_PATH)
+
+
+@app.route("/api/portfolio/backend/stop", methods=["POST"])
+def portfolio_backend_stop():
+    app.logger.info("Portfolio action: backend stop")
+    return _stop_process("backend")
+
+
+@app.route("/api/portfolio/frontend/start", methods=["POST"])
+def portfolio_frontend_start():
+    app.logger.info("Portfolio action: frontend start")
+    return _start_process("frontend", PORTFOLIO_FRONTEND_CMD, PORTFOLIO_FRONTEND_CWD, FRONTEND_LOG_PATH)
+
+
+@app.route("/api/portfolio/frontend/stop", methods=["POST"])
+def portfolio_frontend_stop():
+    app.logger.info("Portfolio action: frontend stop")
+    return _stop_process("frontend")
+
+
+@app.route("/api/portfolio/git/pull", methods=["POST"])
+def portfolio_git_pull():
+    git_info = _get_git_info()
+    if git_info["uncommitted_changes"]:
+        return jsonify({"error": "Wykryto niezacommitowane zmiany. Git pull zablokowany."}), 409
+
+    app.logger.info("Portfolio action: git pull")
+    pull_proc = subprocess.run(
+        ["git", "pull"],
+        cwd=PORTFOLIO_REPO_PATH,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    return jsonify(
+        {
+            "returncode": pull_proc.returncode,
+            "stdout": pull_proc.stdout,
+            "stderr": pull_proc.stderr,
+        }
+    ), (200 if pull_proc.returncode == 0 else 500)
+
+
+@app.route("/api/portfolio/logs/backend", methods=["GET"])
+def portfolio_backend_logs():
+    lines = request.args.get("lines", default=50, type=int)
+    lines = max(1, min(lines, 1000))
+    return jsonify({"content": _tail_file(BACKEND_LOG_PATH, lines=lines)})
+
+
+@app.route("/api/portfolio/logs/frontend", methods=["GET"])
+def portfolio_frontend_logs():
+    lines = request.args.get("lines", default=50, type=int)
+    lines = max(1, min(lines, 1000))
+    return jsonify({"content": _tail_file(FRONTEND_LOG_PATH, lines=lines)})
 
 
 if __name__ == "__main__":
