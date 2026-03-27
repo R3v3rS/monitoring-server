@@ -8,7 +8,11 @@ from datetime import datetime
 
 import psutil
 from flask import Flask, jsonify, render_template_string, request
-from system_monitor import power as power_monitor
+
+if __package__ in (None, ""):
+    import power as power_monitor
+else:
+    from system_monitor import power as power_monitor
 
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
