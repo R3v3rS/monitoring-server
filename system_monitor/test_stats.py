@@ -49,6 +49,8 @@ class StatsEndpointTest(unittest.TestCase):
         payload = response.get_json()
         self.assertIn('cpu_watts', payload)
         self.assertIn('timestamp', payload)
+        self.assertIn('source_available', payload)
+        self.assertIn('last_error', payload)
 
     @patch(
         'system_monitor.app.power_monitor.get_power_snapshot',
@@ -58,6 +60,9 @@ class StatsEndpointTest(unittest.TestCase):
             'rolling_avg_watts': 11.3,
             'min_watts': 8.2,
             'max_watts': 15.1,
+            'source_available': True,
+            'last_error': None,
+            'last_error_timestamp': None,
         },
     )
     def test_cpu_power_endpoint_returns_latest_snapshot(self, _mock_snapshot):

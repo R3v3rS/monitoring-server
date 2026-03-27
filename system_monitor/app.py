@@ -95,6 +95,7 @@ DASHBOARD_HTML = """
       <div class="label">CPU Power</div>
       <div id="cpuPowerValue" class="value">-- W</div>
       <div id="cpuPowerMeta" class="label">avg: -- W | min: -- W | max: -- W</div>
+      <div id="cpuPowerWarning" class="warning"></div>
       <canvas id="cpuPowerChart" class="chart" width="320" height="80"></canvas>
     </div>
 
@@ -288,6 +289,15 @@ async function refreshCpuPower() {
   document.getElementById('cpuPowerValue').textContent = `${watts.toFixed(2)} W`;
   document.getElementById('cpuPowerMeta').textContent =
     `avg: ${Number(p.rolling_avg_watts || watts).toFixed(2)} W | min: ${Number(p.min_watts || watts).toFixed(2)} W | max: ${Number(p.max_watts || watts).toFixed(2)} W`;
+
+  const cpuPowerWarning = document.getElementById('cpuPowerWarning');
+  if (p.source_available) {
+    cpuPowerWarning.textContent = '';
+  } else {
+    cpuPowerWarning.textContent = p.last_error
+      ? `Brak odczytu mocy CPU: ${p.last_error}`
+      : 'Brak odczytu mocy CPU. Sprawdź czy dostępny jest /sys/class/powercap/intel-rapl:0/energy_uj';
+  }
 
   cpuPowerHistory.push(watts);
   if (cpuPowerHistory.length > 40) cpuPowerHistory.shift();
@@ -880,6 +890,9 @@ def cpu_power():
             "rolling_avg_watts": snapshot["rolling_avg_watts"],
             "min_watts": snapshot["min_watts"],
             "max_watts": snapshot["max_watts"],
+            "source_available": snapshot["source_available"],
+            "last_error": snapshot["last_error"],
+            "last_error_timestamp": snapshot["last_error_timestamp"],
         }
     )
 
