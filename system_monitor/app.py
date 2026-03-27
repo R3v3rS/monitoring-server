@@ -8,6 +8,7 @@ from datetime import datetime
 
 import psutil
 from flask import Flask, jsonify, render_template_string, request
+from system_monitor import power as power_monitor
 
 app = Flask(__name__)
 app.logger.setLevel(logging.INFO)
@@ -71,6 +72,7 @@ DASHBOARD_HTML = """
     details { margin-top: 8px; }
     pre { background: #111; color: #eaeaea; padding: 10px; border-radius: 8px; max-height: 220px; overflow: auto; white-space: pre-wrap; }
     .warning { color: #b26a00; font-weight: bold; }
+    .chart { width: 100%; height: 80px; }
   </style>
 </head>
 <body>
@@ -83,6 +85,13 @@ DASHBOARD_HTML = """
       <div id="cpuValue" class="value">--%</div>
       <div class="bar-wrap"><div id="cpuBar" class="bar"></div></div>
       <div id="cpuFreq" class="label"></div>
+    </div>
+
+    <div class="card">
+      <div class="label">CPU Power</div>
+      <div id="cpuPowerValue" class="value">-- W</div>
+      <div id="cpuPowerMeta" class="label">avg: -- W | min: -- W | max: -- W</div>
+      <canvas id="cpuPowerChart" class="chart" width="320" height="80"></canvas>
     </div>
 
     <div class="card">
@@ -236,6 +245,49 @@ function valHtml(value, cls) {
 
 function fanModeLabel(mode) {
   return mode === 'manual' ? 'RĘCZNY' : 'AUTO';
+}
+
+
+const cpuPowerHistory = [];
+
+function drawCpuPowerChart() {
+  const canvas = document.getElementById('cpuPowerChart');
+  const ctx = canvas.getContext('2d');
+  const width = canvas.width;
+  const height = canvas.height;
+  ctx.clearRect(0, 0, width, height);
+
+  if (!cpuPowerHistory.length) return;
+
+  const min = Math.min(...cpuPowerHistory);
+  const max = Math.max(...cpuPowerHistory);
+  const spread = Math.max(0.5, max - min);
+
+  ctx.beginPath();
+  cpuPowerHistory.forEach((value, index) => {
+    const x = (index / Math.max(1, cpuPowerHistory.length - 1)) * width;
+    const normalized = (value - min) / spread;
+    const y = height - normalized * (height - 4) - 2;
+    if (index === 0) ctx.moveTo(x, y);
+    else ctx.lineTo(x, y);
+  });
+  ctx.strokeStyle = '#1a73e8';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+}
+
+async function refreshCpuPower() {
+  const res = await fetch('/api/cpu-power');
+  const p = await res.json();
+
+  const watts = Number(p.cpu_watts || 0);
+  document.getElementById('cpuPowerValue').textContent = `${watts.toFixed(2)} W`;
+  document.getElementById('cpuPowerMeta').textContent =
+    `avg: ${Number(p.rolling_avg_watts || watts).toFixed(2)} W | min: ${Number(p.min_watts || watts).toFixed(2)} W | max: ${Number(p.max_watts || watts).toFixed(2)} W`;
+
+  cpuPowerHistory.push(watts);
+  if (cpuPowerHistory.length > 40) cpuPowerHistory.shift();
+  drawCpuPowerChart();
 }
 
 function updateFanControls(data) {
@@ -459,10 +511,12 @@ for (const channel of ['pwm1', 'pwm2', 'pwm3']) {
 }
 
 refresh();
+refreshCpuPower();
 refreshFanControl();
 refreshPortfolioStatus();
 refreshPortfolioLogs();
 setInterval(refresh, 2000);
+setInterval(refreshCpuPower, 2000);
 setInterval(refreshFanControl, 4000);
 setInterval(refreshPortfolioStatus, 5000);
 </script>
@@ -621,6 +675,7 @@ def _restore_fans_on_exit():
 
 _cache_original_fan_modes()
 os.makedirs(LOGS_DIR, exist_ok=True)
+power_monitor.start_power_monitor()
 
 
 def _portfolio_repo_available():
@@ -807,6 +862,20 @@ def stats():
             "fans": fans,
             "uptime_seconds": uptime_seconds,
             "top_processes": _top_processes(limit=5),
+        }
+    )
+
+
+@app.route("/api/cpu-power")
+def cpu_power():
+    snapshot = power_monitor.get_power_snapshot()
+    return jsonify(
+        {
+            "cpu_watts": snapshot["cpu_watts"],
+            "timestamp": snapshot["timestamp"],
+            "rolling_avg_watts": snapshot["rolling_avg_watts"],
+            "min_watts": snapshot["min_watts"],
+            "max_watts": snapshot["max_watts"],
         }
     )
 
