@@ -1,14 +1,24 @@
 import time
+import atexit
+import logging
 from datetime import datetime
 
 import psutil
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template_string, request
 
 app = Flask(__name__)
+app.logger.setLevel(logging.INFO)
 
 _prev_disk_io = None
 _prev_net_io = None
 _prev_ts = None
+
+HWMON_BASE_PATH = "/sys/class/hwmon/hwmon0"
+FAN_CHANNELS = ("pwm1", "pwm2", "pwm3")
+FAN_MIN_PWM = {"pwm1": 64, "pwm2": 0, "pwm3": 0}
+FAN_AUTO_MODE = 5
+FAN_MANUAL_MODE = 1
+_fan_original_modes = {}
 
 
 DASHBOARD_HTML = """
@@ -108,6 +118,30 @@ DASHBOARD_HTML = """
     <tbody id="procBody"></tbody>
   </table>
 
+  <h2>Sterowanie wentylatorami</h2>
+  <div class="grid">
+    <div class="card">
+      <div class="label">pwm1 <span id="badge-pwm1">--</span></div>
+      <input type="range" id="slider-pwm1" min="0" max="100" value="0" />
+      <div id="value-pwm1" class="label">--</div>
+      <button id="toggle-pwm1" onclick="toggleFanMode('pwm1')">--</button>
+    </div>
+    <div class="card">
+      <div class="label">pwm2 <span id="badge-pwm2">--</span></div>
+      <input type="range" id="slider-pwm2" min="0" max="100" value="0" />
+      <div id="value-pwm2" class="label">--</div>
+      <button id="toggle-pwm2" onclick="toggleFanMode('pwm2')">--</button>
+    </div>
+    <div class="card">
+      <div class="label">pwm3 <span id="badge-pwm3">--</span></div>
+      <input type="range" id="slider-pwm3" min="0" max="100" value="0" />
+      <div id="value-pwm3" class="label">--</div>
+      <button id="toggle-pwm3" onclick="toggleFanMode('pwm3')">--</button>
+    </div>
+  </div>
+  <p><button onclick="resetFansAuto()">Reset wszystkich do AUTO</button></p>
+  <div id="fanControlError" class="red"></div>
+
 <script>
 function clsByPercent(value, isTemp=false) {
   if (isTemp) {
@@ -136,6 +170,59 @@ function fmtUptime(seconds) {
 
 function valHtml(value, cls) {
   return `<span class="${cls}">${value}</span>`;
+}
+
+function fanModeLabel(mode) {
+  return mode === 'manual' ? 'RĘCZNY' : 'AUTO';
+}
+
+function updateFanControls(data) {
+  for (const channel of ['pwm1', 'pwm2', 'pwm3']) {
+    const state = data[channel];
+    const isManual = state.mode === 'manual';
+    document.getElementById(`badge-${channel}`).textContent = fanModeLabel(state.mode);
+    document.getElementById(`badge-${channel}`).className = isManual ? 'yellow' : 'green';
+
+    const slider = document.getElementById(`slider-${channel}`);
+    slider.disabled = !isManual;
+    slider.value = state.percent ?? 0;
+    document.getElementById(`value-${channel}`).textContent = isManual ? `${state.percent}%` : 'Tryb AUTO';
+
+    const btn = document.getElementById(`toggle-${channel}`);
+    btn.textContent = isManual ? 'Przywróć auto' : 'Ustaw ręcznie';
+  }
+}
+
+async function refreshFanControl() {
+  const errorBox = document.getElementById('fanControlError');
+  try {
+    const res = await fetch('/api/fans/control');
+    const payload = await res.json();
+    if (!res.ok) throw new Error(payload.error || 'Nie udało się pobrać stanu');
+    updateFanControls(payload);
+    errorBox.textContent = '';
+  } catch (err) {
+    errorBox.textContent = err.message;
+  }
+}
+
+async function toggleFanMode(channel) {
+  const slider = document.getElementById(`slider-${channel}`);
+  const manual = !slider.disabled;
+  const body = manual
+    ? { channel, mode: 'auto' }
+    : { channel, mode: 'manual', percent: Number.parseInt(slider.value, 10) };
+  await fetch('/api/fans/control', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  await refreshFanControl();
+}
+
+async function resetFansAuto() {
+  await fetch('/api/fans/reset', { method: 'POST' });
+  await refreshFanControl();
 }
 
 async function refresh() {
@@ -190,8 +277,27 @@ async function refresh() {
   ).join('');
 }
 
+for (const channel of ['pwm1', 'pwm2', 'pwm3']) {
+  document.getElementById(`slider-${channel}`).addEventListener('change', async (event) => {
+    const slider = event.target;
+    if (slider.disabled) return;
+    await fetch('/api/fans/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        channel,
+        mode: 'manual',
+        percent: Number.parseInt(slider.value, 10),
+      }),
+    });
+    await refreshFanControl();
+  });
+}
+
 refresh();
+refreshFanControl();
 setInterval(refresh, 2000);
+setInterval(refreshFanControl, 4000);
 </script>
 </body>
 </html>
@@ -279,6 +385,76 @@ def _top_processes(limit=5):
     return processes[:limit]
 
 
+def _sysfs_file(channel, suffix=""):
+    return f"{HWMON_BASE_PATH}/{channel}{suffix}"
+
+
+def _read_sysfs_int(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return int(f.read().strip())
+
+
+def _write_sysfs_int(path, value):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(value))
+
+
+def _validate_channel(channel):
+    return channel in FAN_CHANNELS
+
+
+def _percent_to_pwm(percent):
+    return int((percent * 255) / 100)
+
+
+def _pwm_to_percent(pwm_value):
+    return int(round((pwm_value * 100) / 255))
+
+
+def _read_fan_control_state(channel):
+    mode_value = _read_sysfs_int(_sysfs_file(channel, "_enable"))
+    if mode_value == FAN_MANUAL_MODE:
+        pwm_value = _read_sysfs_int(_sysfs_file(channel))
+        return {"mode": "manual", "pwm_value": pwm_value, "percent": _pwm_to_percent(pwm_value)}
+    return {"mode": "auto", "pwm_value": None, "percent": None}
+
+
+def _set_manual_pwm(channel, percent):
+    pwm_value = _percent_to_pwm(percent)
+    pwm_value = max(FAN_MIN_PWM[channel], min(255, pwm_value))
+    _write_sysfs_int(_sysfs_file(channel, "_enable"), FAN_MANUAL_MODE)
+    _write_sysfs_int(_sysfs_file(channel), pwm_value)
+
+
+def _restore_fan_modes(use_original=False):
+    errors = []
+    for channel in FAN_CHANNELS:
+        try:
+            target_mode = _fan_original_modes.get(channel, FAN_AUTO_MODE) if use_original else FAN_AUTO_MODE
+            _write_sysfs_int(_sysfs_file(channel, "_enable"), target_mode)
+        except Exception as exc:  # noqa: BLE001
+            app.logger.error("Fan reset error for %s: %s", channel, exc)
+            errors.append({"channel": channel, "error": str(exc)})
+    return errors
+
+
+def _cache_original_fan_modes():
+    for channel in FAN_CHANNELS:
+        try:
+            _fan_original_modes[channel] = _read_sysfs_int(_sysfs_file(channel, "_enable"))
+        except Exception as exc:  # noqa: BLE001
+            app.logger.error("Cannot read original mode for %s: %s", channel, exc)
+            _fan_original_modes[channel] = FAN_AUTO_MODE
+
+
+@atexit.register
+def _restore_fans_on_exit():
+    _restore_fan_modes(use_original=True)
+
+
+_cache_original_fan_modes()
+
+
 @app.route("/")
 def dashboard():
     return render_template_string(DASHBOARD_HTML)
@@ -345,6 +521,50 @@ def stats():
             "top_processes": _top_processes(limit=5),
         }
     )
+
+
+@app.route("/api/fans/control", methods=["GET"])
+def get_fans_control():
+    try:
+        payload = {channel: _read_fan_control_state(channel) for channel in FAN_CHANNELS}
+        return jsonify(payload)
+    except Exception as exc:  # noqa: BLE001
+        app.logger.error("Error reading fans control: %s", exc)
+        return jsonify({"error": "Błąd odczytu sterowania wentylatorami"}), 500
+
+
+@app.route("/api/fans/control", methods=["POST"])
+def set_fans_control():
+    payload = request.get_json(silent=True) or {}
+    channel = payload.get("channel")
+    mode = payload.get("mode")
+    percent = payload.get("percent")
+
+    if not _validate_channel(channel):
+        return jsonify({"error": "Nieprawidłowy channel"}), 400
+    if mode not in ("manual", "auto"):
+        return jsonify({"error": "Nieprawidłowy mode"}), 400
+    if mode == "manual" and (not isinstance(percent, int) or percent < 0 or percent > 100):
+        return jsonify({"error": "percent musi być liczbą całkowitą 0-100"}), 400
+
+    try:
+        if mode == "manual":
+            _set_manual_pwm(channel, percent)
+        else:
+            _write_sysfs_int(_sysfs_file(channel, "_enable"), FAN_AUTO_MODE)
+        return jsonify(_read_fan_control_state(channel))
+    except PermissionError:
+        return jsonify({"error": "Brak uprawnień do zapisu PWM — sprawdź reguły udev"}), 403
+    except Exception as exc:  # noqa: BLE001
+        app.logger.error("Error setting fan control (%s): %s", channel, exc)
+        return jsonify({"error": "Błąd zapisu sterowania wentylatorami"}), 500
+
+
+@app.route("/api/fans/reset", methods=["POST"])
+def reset_fans():
+    errors = _restore_fan_modes(use_original=False)
+    status = 500 if errors else 200
+    return jsonify({"status": "ok" if not errors else "partial_error", "errors": errors}), status
 
 
 if __name__ == "__main__":
