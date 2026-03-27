@@ -690,11 +690,17 @@ def _get_git_info():
         commit_hash = commit_data[0]
         commit_msg = commit_data[1] if len(commit_data) > 1 else ""
 
+    status_lines = [
+        line
+        for line in status_proc.stdout.splitlines()
+        if line and not line.startswith("??")
+    ]
+
     return {
         "branch": branch,
         "last_commit": commit_hash,
         "last_commit_msg": commit_msg,
-        "uncommitted_changes": bool(status_proc.stdout.strip()),
+        "uncommitted_changes": bool(status_lines),
     }
 
 
