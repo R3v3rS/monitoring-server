@@ -100,6 +100,14 @@ DASHBOARD_HTML = """
     </div>
 
     <div class="card">
+      <div class="label">Package Power (intel-rapl:0)</div>
+      <div id="packagePowerValue" class="value">-- W</div>
+      <div id="packagePowerMeta" class="label">avg: -- W | min: -- W | max: -- W</div>
+      <div id="packagePowerWarning" class="warning"></div>
+      <canvas id="packagePowerChart" class="chart" width="320" height="80"></canvas>
+    </div>
+
+    <div class="card">
       <div class="label">RAM</div>
       <div id="ramValue" class="value">--%</div>
       <div class="bar-wrap"><div id="ramBar" class="bar"></div></div>
@@ -254,23 +262,24 @@ function fanModeLabel(mode) {
 
 
 const cpuPowerHistory = [];
+const packagePowerHistory = [];
 
-function drawCpuPowerChart() {
-  const canvas = document.getElementById('cpuPowerChart');
+function drawPowerChart(canvasId, history) {
+  const canvas = document.getElementById(canvasId);
   const ctx = canvas.getContext('2d');
   const width = canvas.width;
   const height = canvas.height;
   ctx.clearRect(0, 0, width, height);
 
-  if (!cpuPowerHistory.length) return;
+  if (!history.length) return;
 
-  const min = Math.min(...cpuPowerHistory);
-  const max = Math.max(...cpuPowerHistory);
+  const min = Math.min(...history);
+  const max = Math.max(...history);
   const spread = Math.max(0.5, max - min);
 
   ctx.beginPath();
-  cpuPowerHistory.forEach((value, index) => {
-    const x = (index / Math.max(1, cpuPowerHistory.length - 1)) * width;
+  history.forEach((value, index) => {
+    const x = (index / Math.max(1, history.length - 1)) * width;
     const normalized = (value - min) / spread;
     const y = height - normalized * (height - 4) - 2;
     if (index === 0) ctx.moveTo(x, y);
@@ -285,23 +294,42 @@ async function refreshCpuPower() {
   const res = await fetch('/api/cpu-power');
   const p = await res.json();
 
-  const watts = Number(p.cpu_watts || 0);
+  const cpu = p.cpu || {};
+  const packagePower = p.package || {};
+
+  const watts = Number(cpu.watts || p.cpu_watts || 0);
   document.getElementById('cpuPowerValue').textContent = `${watts.toFixed(2)} W`;
   document.getElementById('cpuPowerMeta').textContent =
-    `avg: ${Number(p.rolling_avg_watts || watts).toFixed(2)} W | min: ${Number(p.min_watts || watts).toFixed(2)} W | max: ${Number(p.max_watts || watts).toFixed(2)} W`;
-
+    `avg: ${Number(cpu.rolling_avg_watts || p.rolling_avg_watts || watts).toFixed(2)} W | min: ${Number(cpu.min_watts || p.min_watts || watts).toFixed(2)} W | max: ${Number(cpu.max_watts || p.max_watts || watts).toFixed(2)} W`;
   const cpuPowerWarning = document.getElementById('cpuPowerWarning');
-  if (p.source_available) {
+  if (cpu.source_available ?? p.source_available) {
     cpuPowerWarning.textContent = '';
   } else {
-    cpuPowerWarning.textContent = p.last_error
-      ? `Brak odczytu mocy CPU: ${p.last_error}`
-      : 'Brak odczytu mocy CPU. Sprawdź czy dostępny jest /sys/class/powercap/intel-rapl:0/energy_uj';
+    cpuPowerWarning.textContent = (cpu.last_error || p.last_error)
+      ? `Brak odczytu mocy CPU: ${cpu.last_error || p.last_error}`
+      : 'Brak odczytu mocy CPU. Sprawdź czy dostępny jest /sys/class/powercap/intel-rapl:0:0/energy_uj';
   }
 
   cpuPowerHistory.push(watts);
   if (cpuPowerHistory.length > 40) cpuPowerHistory.shift();
-  drawCpuPowerChart();
+  drawPowerChart('cpuPowerChart', cpuPowerHistory);
+
+  const packageWatts = Number(packagePower.watts || 0);
+  document.getElementById('packagePowerValue').textContent = `${packageWatts.toFixed(2)} W`;
+  document.getElementById('packagePowerMeta').textContent =
+    `avg: ${Number(packagePower.rolling_avg_watts || packageWatts).toFixed(2)} W | min: ${Number(packagePower.min_watts || packageWatts).toFixed(2)} W | max: ${Number(packagePower.max_watts || packageWatts).toFixed(2)} W`;
+  const packagePowerWarning = document.getElementById('packagePowerWarning');
+  if (packagePower.source_available) {
+    packagePowerWarning.textContent = '';
+  } else {
+    packagePowerWarning.textContent = packagePower.last_error
+      ? `Brak odczytu mocy package: ${packagePower.last_error}`
+      : 'Brak odczytu mocy package. Sprawdź czy dostępny jest /sys/class/powercap/intel-rapl:0/energy_uj';
+  }
+
+  packagePowerHistory.push(packageWatts);
+  if (packagePowerHistory.length > 40) packagePowerHistory.shift();
+  drawPowerChart('packagePowerChart', packagePowerHistory);
 }
 
 function updateFanControls(data) {
@@ -883,16 +911,21 @@ def stats():
 @app.route("/api/cpu-power")
 def cpu_power():
     snapshot = power_monitor.get_power_snapshot()
+    cpu = snapshot["cpu"]
+    package = snapshot["package"]
     return jsonify(
         {
-            "cpu_watts": snapshot["cpu_watts"],
-            "timestamp": snapshot["timestamp"],
-            "rolling_avg_watts": snapshot["rolling_avg_watts"],
-            "min_watts": snapshot["min_watts"],
-            "max_watts": snapshot["max_watts"],
-            "source_available": snapshot["source_available"],
-            "last_error": snapshot["last_error"],
-            "last_error_timestamp": snapshot["last_error_timestamp"],
+            "cpu": cpu,
+            "package": package,
+            # Backward-compatible fields for existing clients.
+            "cpu_watts": cpu["watts"],
+            "timestamp": cpu["timestamp"],
+            "rolling_avg_watts": cpu["rolling_avg_watts"],
+            "min_watts": cpu["min_watts"],
+            "max_watts": cpu["max_watts"],
+            "source_available": cpu["source_available"],
+            "last_error": cpu["last_error"],
+            "last_error_timestamp": cpu["last_error_timestamp"],
         }
     )
 

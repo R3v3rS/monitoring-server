@@ -47,6 +47,8 @@ class StatsEndpointTest(unittest.TestCase):
         response = self.client.get('/api/cpu-power')
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
+        self.assertIn('cpu', payload)
+        self.assertIn('package', payload)
         self.assertIn('cpu_watts', payload)
         self.assertIn('timestamp', payload)
         self.assertIn('source_available', payload)
@@ -55,14 +57,26 @@ class StatsEndpointTest(unittest.TestCase):
     @patch(
         'system_monitor.app.power_monitor.get_power_snapshot',
         return_value={
-            'cpu_watts': 12.5,
-            'timestamp': '2026-01-01T00:00:00+00:00',
-            'rolling_avg_watts': 11.3,
-            'min_watts': 8.2,
-            'max_watts': 15.1,
-            'source_available': True,
-            'last_error': None,
-            'last_error_timestamp': None,
+            'cpu': {
+                'watts': 12.5,
+                'timestamp': '2026-01-01T00:00:00+00:00',
+                'rolling_avg_watts': 11.3,
+                'min_watts': 8.2,
+                'max_watts': 15.1,
+                'source_available': True,
+                'last_error': None,
+                'last_error_timestamp': None,
+            },
+            'package': {
+                'watts': 17.9,
+                'timestamp': '2026-01-01T00:00:00+00:00',
+                'rolling_avg_watts': 16.7,
+                'min_watts': 13.0,
+                'max_watts': 20.2,
+                'source_available': True,
+                'last_error': None,
+                'last_error_timestamp': None,
+            },
         },
     )
     def test_cpu_power_endpoint_returns_latest_snapshot(self, _mock_snapshot):
@@ -71,6 +85,7 @@ class StatsEndpointTest(unittest.TestCase):
         payload = response.get_json()
         self.assertEqual(payload['cpu_watts'], 12.5)
         self.assertEqual(payload['timestamp'], '2026-01-01T00:00:00+00:00')
+        self.assertEqual(payload['package']['watts'], 17.9)
 
     def test_io_delta_non_negative_on_first_measurement(self):
         response = self.client.get('/api/stats')
